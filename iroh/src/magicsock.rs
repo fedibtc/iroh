@@ -39,8 +39,9 @@ use n0_future::{
     boxed::BoxStream,
     task::{self, JoinSet},
     time::{self, Duration, Instant},
-    FutureExt, StreamExt,
+    StreamExt,
 };
+use n0_watcher::Watcher as N0Watcher;
 use netwatch::{interfaces, netmon};
 #[cfg(all(not(wasm_browser), not(feature = "no_holepunch")))]
 use netwatch::UdpSocket;
@@ -2451,16 +2452,17 @@ impl Actor {
     async fn run(mut self) -> Result<()> {
         // Setup network monitoring
         let (link_change_s, mut link_change_r) = mpsc::channel(8);
-        let _token = self
-            .network_monitor
-            .subscribe(move |is_major| {
-                let link_change_s = link_change_s.clone();
-                async move {
-                    link_change_s.send(is_major).await.ok();
+        let mut watcher = self.network_monitor.interface_state();
+        task::spawn(async move {
+            let mut old_state = watcher.get();
+            while let Ok(new_state) = watcher.updated().await {
+                let is_major = new_state.is_major_change(&old_state);
+                old_state = new_state;
+                if link_change_s.send(is_major).await.is_err() {
+                    break;
                 }
-                .boxed()
-            })
-            .await?;
+            }
+        });
 
         // Let the the heartbeat only start a couple seconds later
         #[cfg(all(not(wasm_browser), not(feature = "no_holepunch")))]
