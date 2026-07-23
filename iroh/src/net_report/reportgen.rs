@@ -40,7 +40,6 @@ use n0_future::future::Pending;
 use n0_future::{
     task::{self, AbortOnDropHandle, JoinSet},
     time::{self, Duration, Instant},
-    StreamExt as _,
 };
 #[cfg(all(not(wasm_browser), not(feature = "no_holepunch")))]
 use netwatch::{interfaces, UdpSocket};
@@ -1314,7 +1313,7 @@ async fn measure_https_latency(
     let client = builder.build()?;
 
     let start = Instant::now();
-    let response = client.request(reqwest::Method::GET, url).send().await?;
+    let mut response = client.request(reqwest::Method::GET, url).send().await?;
     let latency = start.elapsed();
     if response.status().is_success() {
         // Only `None` if a different hyper HttpConnector in the request.
@@ -1327,14 +1326,21 @@ async fn measure_https_latency(
         let remote_ip = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
         // Drain the response body to be nice to the server, up to a limit.
-        const MAX_BODY_SIZE: usize = 8 << 10; // 8 KiB
-        let mut body_size = 0;
-        let mut stream = response.bytes_stream();
-        // ignore failing frames
-        while let Some(Ok(chunk)) = stream.next().await {
-            body_size += chunk.len();
-            if body_size >= MAX_BODY_SIZE {
-                break;
+        // chunk() is used instead of bytes_stream() so the stream feature of
+        // reqwest can stay off: on wasm it pulls in wasm-streams, which
+        // collides with the copy reqwest 0.13 (via iroh 1.0) links downstream.
+        // reqwest's wasm backend has no chunk() and browsers manage the
+        // connection themselves, so there the body is simply not drained.
+        #[cfg(not(wasm_browser))]
+        {
+            const MAX_BODY_SIZE: usize = 8 << 10; // 8 KiB
+            let mut body_size = 0;
+            // ignore failing frames
+            while let Ok(Some(chunk)) = response.chunk().await {
+                body_size += chunk.len();
+                if body_size >= MAX_BODY_SIZE {
+                    break;
+                }
             }
         }
 

@@ -54,9 +54,11 @@ quinn-proto = { package = "iroh-quinn-proto", version = "0.13.0" }
 quinn-udp = { package = "iroh-quinn-udp", version = "0.5.7" }
 rand = "0.8"
 rcgen = "0.13"
+# stream is only used to drain probe responses in net_report, which never
+# runs in browsers; enabling it on wasm pulls wasm-streams into downstream
+# graphs, where it collides with the copy reqwest 0.13 (via iroh 1.0) uses.
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
-    "stream",
 ] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
