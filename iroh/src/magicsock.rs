@@ -2384,7 +2384,16 @@ impl ActorSocketState {
         addr_v6: Option<SocketAddrV6>,
         metrics: Arc<portmapper::Metrics>,
     ) -> Result<Self> {
-        let port_mapper = portmapper::Client::with_metrics(Default::default(), metrics);
+        #[cfg(target_os = "ios")]
+        let portmapper_config = portmapper::Config {
+            enable_upnp: false,
+            enable_pcp: false,
+            enable_nat_pmp: false,
+            ..Default::default()
+        };
+        #[cfg(not(target_os = "ios"))]
+        let portmapper_config = portmapper::Config::default();
+        let port_mapper = portmapper::Client::with_metrics(portmapper_config, metrics);
         let (v4, v6) = Self::bind_sockets(addr_v4, addr_v6)?;
 
         let this = Self {
