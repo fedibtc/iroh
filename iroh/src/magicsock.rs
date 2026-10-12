@@ -597,8 +597,17 @@ impl MagicSock {
                             .map(|err| err.kind() == io::ErrorKind::WouldBlock)
                             .unwrap_or_default();
                         if udp_pending && relay_pending {
-                            // Handle backpressure.
-                            return Err(io::Error::new(io::ErrorKind::WouldBlock, "pending"));
+                            // `IoPoller::poll_writable` is Ready when *any* path is writable,
+                            // while this transmit can only use this node's paths. Returning
+                            // `WouldBlock` makes quinn retry it in a loop that never yields
+                            // while another path stays writable, which can pin every runtime
+                            // worker and starve the tasks that would unblock these paths.
+                            // Drop the transmit instead and let QUIC recover the loss.
+                            debug!(
+                                node = %node_id.fmt_short(),
+                                "all paths to node are blocked, dropping transmit",
+                            );
+                            return Ok(());
                         } else {
                             if relay_sent || udp_sent {
                                 trace!(
@@ -668,12 +677,10 @@ impl MagicSock {
                                "sent IpMapped transmit over UDP");
                             }
                             Err(err) => {
-                                // No need to print "WouldBlock" errors to the console
+                                // Never return "WouldBlock": see the `udp_pending &&
+                                // relay_pending` case above. Dropping lets QUIC recover.
                                 if err.kind() == io::ErrorKind::WouldBlock {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::WouldBlock,
-                                        "pending",
-                                    ));
+                                    debug!(dst = %addr, "udp path is blocked, dropping transmit");
                                 } else {
                                     warn!(
                                         dst = %addr,
