@@ -324,6 +324,17 @@ impl IpSender {
         src: Option<IpAddr>,
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
+        // iOS asks the user for Local Network access on the first send to an
+        // address on a network the device is attached to. Remotes advertise their
+        // interface addresses as NAT traversal candidates, and a remote's home LAN
+        // often shares the device's range, so a send there would raise the prompt.
+        // Treat such destinations as unreachable: report success and let the path
+        // fail validation, as with any lost UDP packet.
+        #[cfg(target_os = "ios")]
+        if is_local_network_addr(dst.ip()) {
+            trace!(%dst, "not sending to a local network address on iOS");
+            return Poll::Ready(Ok(()));
+        }
         let total_bytes = transmit.contents.len() as u64;
         let res = Pin::new(&mut self.sender).poll_send(
             &noq_udp::Transmit {
@@ -351,6 +362,24 @@ impl IpSender {
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+/// Whether sending to `ip` is a local network operation that iOS gates behind
+/// the Local Network permission: private, shared (CGNAT), link-local,
+/// multicast, and broadcast ranges. Loopback is not a local network.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+fn is_local_network_addr(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(ip) => {
+            let shared = ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000) == 64;
+            ip.is_private()
+                || shared
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+        }
+        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local() || ip.is_multicast(),
     }
 }
 
@@ -480,6 +509,51 @@ impl IpTransports {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_local_network_addr() {
+        let local = [
+            "10.0.0.1",
+            "10.1.2.3",
+            "172.16.0.0",
+            "172.31.255.255",
+            "192.168.1.20",
+            "100.64.0.0",
+            "100.127.255.255",
+            "169.254.1.1",
+            "224.0.0.251",
+            "255.255.255.255",
+            "::ffff:192.168.1.20",
+            "fc00::1",
+            "fd7a:115c:a1e0::1",
+            "fe80::1",
+            "febf::1",
+            "ff02::fb",
+        ];
+        let not_local = [
+            "8.8.8.8",
+            "172.15.255.255",
+            "172.32.0.0",
+            "192.169.0.1",
+            "100.63.255.255",
+            "100.128.0.0",
+            "127.0.0.1",
+            "::1",
+            "::ffff:8.8.8.8",
+            "2001:db8::1",
+            "fbff::1",
+            "fec0::1",
+        ];
+        for ip in local {
+            assert!(is_local_network_addr(ip.parse().unwrap()), "{ip} is local");
+        }
+        for ip in not_local {
+            assert!(
+                !is_local_network_addr(ip.parse().unwrap()),
+                "{ip} is not local"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_bind_sorting() -> n0_error::Result {
