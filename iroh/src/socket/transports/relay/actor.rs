@@ -1526,8 +1526,8 @@ mod tests {
 
     use super::{
         ActiveRelayActor, ActiveRelayActorOptions, ActiveRelayMessage, ActiveRelayPrioMessage,
-        Config, RELAY_INACTIVE_CLEANUP_TIME, RelayActor, RelayConnectionOptions, RelayMap,
-        RelayRecvDatagram, RelaySendItem, UNDELIVERABLE_DATAGRAM_TIMEOUT,
+        Config, RELAY_INACTIVE_CLEANUP_TIME, RelayActor, RelayActorMessage, RelayConnectionOptions,
+        RelayMap, RelayRecvDatagram, RelaySendItem, UNDELIVERABLE_DATAGRAM_TIMEOUT,
     };
     use crate::{dns::DnsResolver, metrics::SocketMetrics, test_utils};
 
@@ -2026,5 +2026,262 @@ mod tests {
             watch.get(),
             Some(RelayStatus::new(b, RelayConnectionState::Connected)),
         );
+    }
+    /// A TCP proxy in front of a relay server that can go silent.
+    ///
+    /// Once frozen it forwards nothing in either direction, but keeps every
+    /// connection open and keeps reading what the client sends, so the client's
+    /// kernel sees its writes acknowledged. This is what a relay path looks like
+    /// to a client when the relay stops answering without closing the TCP flow.
+    struct FreezableProxy {
+        url: RelayUrl,
+        frozen: Arc<AtomicBool>,
+        _task: AbortOnDropHandle<()>,
+    }
+
+    impl FreezableProxy {
+        async fn start(target: std::net::SocketAddr) -> Self {
+            use std::sync::atomic::Ordering;
+
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let frozen = Arc::new(AtomicBool::new(false));
+
+            async fn pipe(
+                mut from: tokio::net::tcp::OwnedReadHalf,
+                mut to: tokio::net::tcp::OwnedWriteHalf,
+                frozen: Arc<AtomicBool>,
+            ) {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    let n = match from.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ if frozen.load(Ordering::SeqCst) => {
+                            // A silent path delivers no FIN or RST either.
+                            let _keep_open = to;
+                            return std::future::pending().await;
+                        }
+                        _ => return,
+                    };
+                    if frozen.load(Ordering::SeqCst) {
+                        // Swallow the bytes: acknowledged, never delivered. Keep
+                        // `to` alive so the peer sees no FIN either.
+                        continue;
+                    }
+                    if to.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+
+            let task = tokio::spawn({
+                let frozen = frozen.clone();
+                async move {
+                    let mut conns = tokio::task::JoinSet::new();
+                    loop {
+                        let Ok((client, _)) = listener.accept().await else {
+                            return;
+                        };
+                        let Ok(server) = tokio::net::TcpStream::connect(target).await else {
+                            continue;
+                        };
+                        let (client_read, client_write) = client.into_split();
+                        let (server_read, server_write) = server.into_split();
+                        conns.spawn(pipe(client_read, server_write, frozen.clone()));
+                        conns.spawn(pipe(server_read, client_write, frozen.clone()));
+                    }
+                }
+            });
+            Self {
+                url: format!("https://127.0.0.1:{port}").parse().unwrap(),
+                frozen,
+                _task: AbortOnDropHandle::new(task),
+            }
+        }
+
+        fn freeze(&self) {
+            self.frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// An idle, non-home relay connection exits after `RELAY_INACTIVE_CLEANUP_TIME`
+    /// and closes its WebSocket on the way out. If the relay stops answering just
+    /// then, that close must not hold the actor forever: the actor has to finish so
+    /// that its inboxes close and the [`RelayActor`] stops waiting on it.
+    #[tokio::test]
+    #[traced_test]
+    async fn inactive_relay_exits_when_relay_never_answers_close() -> Result {
+        let (_relay_map, _relay_url, server) = test_utils::run_relay_server().await?;
+        let proxy = FreezableProxy::start(server.https_addr().unwrap()).await;
+
+        let (datagram_recv_tx, _datagram_recv_rx) = mpsc::channel(16);
+        let (_send_datagram_tx, send_datagram_rx) = mpsc::channel(16);
+        let (_prio_inbox_tx, prio_inbox_rx) = mpsc::channel(8);
+        let (inbox_tx, inbox_rx) = mpsc::channel(16);
+        let cancel_token = CancellationToken::new();
+        let mut task = start_active_relay_actor(
+            SecretKey::from_bytes(&[1u8; 32]),
+            cancel_token.clone(),
+            proxy.url.clone(),
+            prio_inbox_rx,
+            inbox_rx,
+            send_datagram_rx,
+            datagram_recv_tx,
+            Default::default(),
+            info_span!("actor-under-test"),
+        );
+
+        // Wait until the actor is connected to the relay server.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (tx, rx) = oneshot::channel();
+                inbox_tx.send(ActiveRelayMessage::PingServer(tx)).await.ok();
+                if tokio::time::timeout(Duration::from_millis(200), rx)
+                    .await
+                    .map(|resp| resp.is_ok())
+                    .unwrap_or_default()
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .std_context("timeout")?;
+        // Let the pongs for the pings sent on connect arrive, so no ping is
+        // outstanding: the connection is healthy and merely idle.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        proxy.freeze();
+        tokio::time::pause();
+        tokio::time::advance(RELAY_INACTIVE_CLEANUP_TIME).await;
+        tokio::time::resume();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), &mut task)
+                .await
+                .is_ok(),
+            "actor task is stuck closing its connection to an unresponsive relay"
+        );
+        cancel_token.cancel();
+        Ok(())
+    }
+
+    /// The production failure: one relay connection stuck closing (above) stops the
+    /// [`RelayActor`] from reaching any other relay, so a working relay is never used
+    /// again and the actor's own inbox fills up ("channel is full").
+    #[tokio::test]
+    #[traced_test]
+    async fn relay_actor_reaches_other_relays_while_one_never_answers_close() -> Result {
+        let (_relay_map, relay_url, server) = test_utils::run_relay_server().await?;
+        let proxy = FreezableProxy::start(server.https_addr().unwrap()).await;
+
+        let (recv_tx, mut recv_rx) = mpsc::channel(16);
+        let metrics = Arc::new(SocketMetrics::default());
+        let config = Config {
+            my_relay: Default::default(),
+            secret_key: SecretKey::from_bytes(&[1u8; 32]),
+            dns_resolver: DnsResolver::new(),
+            proxy_url: None,
+            ipv6_reported: Arc::new(AtomicBool::new(false)),
+            tls_config: CaTlsConfig::insecure_skip_verify()
+                .client_config(default_provider())
+                .expect("infallible"),
+            metrics: metrics.clone(),
+            relay_map: RelayMap::empty(),
+        };
+        let cancel_token = CancellationToken::new();
+        let actor = RelayActor::new(config, recv_tx, cancel_token.clone());
+        let (actor_tx, actor_rx) = mpsc::channel(256);
+        let (send_tx, send_rx) = mpsc::channel(256);
+        let _actor_task = AbortOnDropHandle::new(tokio::spawn(
+            actor
+                .run(actor_rx, send_rx)
+                .instrument(info_span!("relay-actor")),
+        ));
+
+        // Open a relay connection through the proxy, then let it go idle and
+        // close while the relay behind the proxy has gone silent.
+        send_tx
+            .send(RelaySendItem {
+                remote_endpoint: SecretKey::from_bytes(&[9u8; 32]).public(),
+                url: proxy.url.clone(),
+                datagrams: Datagrams::from(b"hello"),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.relay_conns_success.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("proxied relay never connected")?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        proxy.freeze();
+        tokio::time::pause();
+        tokio::time::advance(RELAY_INACTIVE_CLEANUP_TIME).await;
+        tokio::time::resume();
+        // Let the idle connection reach its close.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // A datagram for a peer on the working relay. Started only now, as
+        // advancing time would also have expired this peer's idle connection.
+        let (peer, _echo_task) = start_echo_endpoint(relay_url.clone());
+        send_recv_echo_within(
+            Duration::from_secs(20),
+            RelaySendItem {
+                remote_endpoint: peer,
+                url: relay_url.clone(),
+                datagrams: Datagrams::from(b"still reachable"),
+            },
+            &send_tx,
+            &mut recv_rx,
+        )
+        .await
+        .std_context("relay actor never reached the working relay")?;
+
+        // The actor still drains its control inbox.
+        for _ in 0..300 {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                actor_tx.send(RelayActorMessage::CheckConnectionAfterNetworkChange),
+            )
+            .await
+            .std_context("relay actor stopped reading its inbox")?
+            .unwrap();
+        }
+        cancel_token.cancel();
+        Ok(())
+    }
+
+    /// Like [`send_recv_echo`], with a caller-chosen overall deadline that fails the
+    /// test with an error instead of a panic.
+    async fn send_recv_echo_within(
+        deadline: Duration,
+        item: RelaySendItem,
+        tx: &mpsc::Sender<RelaySendItem>,
+        rx: &mut mpsc::Receiver<RelayRecvDatagram>,
+    ) -> Result<()> {
+        tokio::time::timeout(deadline, async move {
+            loop {
+                let res = tokio::time::timeout(UNDELIVERABLE_DATAGRAM_TIMEOUT, async {
+                    tx.send(item.clone()).await.std_context("send item")?;
+                    let RelayRecvDatagram { datagrams, .. } =
+                        rx.recv().await.std_context("receive queue closed")?;
+                    assert_eq!(datagrams, item.datagrams);
+                    Ok::<_, Error>(())
+                })
+                .await;
+                if matches!(res, Ok(Ok(()))) {
+                    break;
+                }
+            }
+        })
+        .await
+        .std_context("echo deadline exceeded")
     }
 }
