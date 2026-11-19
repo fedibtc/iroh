@@ -302,7 +302,9 @@ impl ActiveRelayActor {
                     // we wait an exponentially increasing time until we attempt to reconnect again.
                     let delay = backoff.next().context("Retries exceeded")?;
                     debug!("Retry in {delay:?}");
-                    time::sleep(delay).await;
+                    if !self.sleep_backoff(delay).await {
+                        break;
+                    }
                 }
                 RelayConnectionError::Established(_) => {
                     // If the relay connection remained established long enough so that we received a pong
@@ -316,6 +318,69 @@ impl ActiveRelayActor {
         // From the existing description, it is wrong here.
         // self.metrics.num_relay_conns_removed.inc();
         Ok(())
+    }
+
+    /// Waits out a reconnect backoff delay while serving the inboxes.
+    ///
+    /// The [`RelayActor`] waits for room in the inbox when it sends a control message,
+    /// and for an answer to [`ActiveRelayPrioMessage::HasNodeRoute`]. A dial can fail
+    /// before [`Self::run_dialing`] reads either, so they are served here as well. The
+    /// inactivity timeout is served too, so a non-home actor that can never dial exits.
+    ///
+    /// Returns `false` if the actor should shut down instead of retrying.
+    async fn sleep_backoff(&mut self, delay: Duration) -> bool {
+        let sleep = time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.stop_token.cancelled() => {
+                    debug!("Shutdown.");
+                    return false;
+                }
+                msg = self.prio_inbox.recv() => {
+                    let Some(msg) = msg else {
+                        warn!("Priority inbox closed, shutdown.");
+                        return false;
+                    };
+                    match msg {
+                        ActiveRelayPrioMessage::HasNodeRoute(_peer, sender) => {
+                            sender.send(false).ok();
+                        }
+                    }
+                }
+                msg = self.inbox.recv() => {
+                    let Some(msg) = msg else {
+                        debug!("Inbox closed, shutdown.");
+                        return false;
+                    };
+                    self.handle_msg_while_disconnected(msg);
+                }
+                _ = &mut self.inactive_timeout, if !self.is_home_relay => {
+                    debug!(?RELAY_INACTIVE_CLEANUP_TIME, "Inactive, exiting.");
+                    return false;
+                }
+                _ = &mut sleep => return true,
+            }
+        }
+    }
+
+    /// Handles an inbox message while not connected to the relay server.
+    fn handle_msg_while_disconnected(&mut self, msg: ActiveRelayMessage) {
+        match msg {
+            ActiveRelayMessage::SetHomeRelay(is_home) => {
+                self.set_home_relay(is_home);
+            }
+            ActiveRelayMessage::CheckConnection(_local_ips) => {}
+            #[cfg(test)]
+            ActiveRelayMessage::GetLocalAddr(sender) => {
+                sender.send(None).ok();
+            }
+            #[cfg(test)]
+            ActiveRelayMessage::PingServer(sender) => {
+                drop(sender);
+            }
+        }
     }
 
     fn build_backoff() -> impl Backoff {
@@ -413,20 +478,7 @@ impl ActiveRelayActor {
                         debug!("Inbox closed, shutdown.");
                         break None;
                     };
-                    match msg {
-                        ActiveRelayMessage::SetHomeRelay(is_home) => {
-                            self.set_home_relay(is_home);
-                        }
-                        ActiveRelayMessage::CheckConnection(_local_ips) => {}
-                        #[cfg(test)]
-                        ActiveRelayMessage::GetLocalAddr(sender) => {
-                            sender.send(None).ok();
-                        }
-                        #[cfg(test)]
-                        ActiveRelayMessage::PingServer(sender) => {
-                            drop(sender);
-                        }
-                    }
+                    self.handle_msg_while_disconnected(msg);
                 }
                 _ = send_datagram_flush.tick() => {
                     self.reset_inactive_timeout();
