@@ -4481,4 +4481,55 @@ mod tests {
 
         Ok(())
     }
+
+    /// Regression test: the actor must keep reading its inbox through a direct address
+    /// update while that inbox is full.
+    ///
+    /// Without relays, the actor answered a direct address update by sending the empty
+    /// net_report result into its own inbox and awaiting room there. The actor is the
+    /// only reader of that inbox, so with a full inbox it waited forever. Every ping
+    /// expiry task then waits forever too, holding its task and its sent-ping entry.
+    ///
+    /// The current-thread runtime fills the inbox before the actor runs again. The actor
+    /// then picks one of the two ready branches at random, so each round would hang with
+    /// a chance of about one half.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_actor_reads_full_inbox_during_direct_addr_update() -> Result<()> {
+        let stack = MagicStack::new(RelayMode::Disabled).await?;
+        let msock = stack.endpoint.magic_sock();
+        let capacity = msock.actor_sender.max_capacity();
+
+        for round in 0..32 {
+            // Let any running update finish, so that `re_stun` starts a new one.
+            time::timeout(Duration::from_secs(5), async {
+                while msock.direct_addr_update_state.is_running() {
+                    time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .with_context(|| format!("round {round}: direct addr update never finished"))?;
+
+            // No await until `re_stun`: the actor cannot run in between.
+            while msock
+                .actor_sender
+                .try_send(ActorMessage::EndpointPingExpired(
+                    usize::MAX,
+                    stun_rs::TransactionId::default(),
+                ))
+                .is_ok()
+            {}
+            msock.re_stun("test");
+
+            time::timeout(Duration::from_secs(5), async {
+                while msock.actor_sender.capacity() < capacity {
+                    time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .with_context(|| format!("round {round}: actor stopped reading its inbox"))?;
+        }
+
+        Ok(())
+    }
 }
