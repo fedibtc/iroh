@@ -2887,10 +2887,10 @@ impl Actor {
         }
         if self.msock.relay_map.is_empty() {
             debug!("skipping net_report, empty RelayMap");
-            self.msg_sender
-                .send(ActorMessage::NetReport(Ok(None), why))
-                .await
-                .ok();
+            // Handle the empty report here, as `handle_actor_message` would. Sending it
+            // to our own inbox would deadlock when the inbox is full: we are its only reader.
+            self.handle_net_report_report(None).await;
+            self.finalize_direct_addrs_update(why);
             return;
         }
 
